@@ -1,5 +1,5 @@
 """
-Hand-controlled robot jogging using video file.
+Hand-controlled robot jogging using video file (headless mode).
 
 This demonstrates:
 - Real-time hand tracking with OpenCV from video file
@@ -8,11 +8,11 @@ This demonstrates:
 - Safe velocity limits and dead zones
 
 How it works:
-- Plays a video file with hand detection
+- Plays a video file with hand detection (no preview window)
 - Center zone = no movement (dead zone)
 - Move hand left/right = jog robot TCP in X-axis
 - Move hand up/down = jog robot TCP in Y-axis
-- Press 'q' to quit, 'SPACE' to pause/resume, 'r' to restart video
+- Press Ctrl+C to quit
 
 Note: Uses color-based hand detection (works best with good lighting
 and distinct hand color vs background).
@@ -51,7 +51,7 @@ SMOOTHING_FACTOR = 0.3  # Lower = smoother but slower response (0.0-1.0)
 
 
 class HandTracker:
-    """Tracks hand position from video file using color detection."""
+    """Tracks hand position from video file using color detection (headless)."""
 
     def __init__(self, video_path: str):
         self.video_path = video_path
@@ -61,7 +61,6 @@ class HandTracker:
         self.position_queue: Queue[tuple[float, float, bool]] = Queue(maxsize=1)
         
         self.running = False
-        self.paused = False
         self.thread: Optional[threading.Thread] = None
         
         # Smoothed position
@@ -76,6 +75,10 @@ class HandTracker:
         # Skin color detection ranges (HSV)
         self.lower_skin = np.array([0, 20, 70], dtype=np.uint8)
         self.upper_skin = np.array([20, 255, 255], dtype=np.uint8)
+        
+        # Statistics
+        self.frame_count = 0
+        self.detection_count = 0
 
     def start(self) -> None:
         """Start the hand tracking thread."""
@@ -95,10 +98,12 @@ class HandTracker:
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
+        total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
         logger.info(f"Starting hand tracker with video: {self.video_path}")
-        logger.info(f"Video: {self.frame_width}x{self.frame_height} @ {self.fps}fps")
-        logger.info("Controls: SPACE=pause/resume, R=restart video, Q=quit")
+        logger.info(f"Video: {self.frame_width}x{self.frame_height} @ {self.fps}fps ({total_frames} frames)")
+        logger.info("Running in headless mode (no preview window)")
+        logger.info("Press Ctrl+C to quit")
         
         self.running = True
         self.thread = threading.Thread(target=self._tracking_loop, daemon=True)
@@ -111,14 +116,19 @@ class HandTracker:
             self.thread.join(timeout=2.0)
         if self.cap:
             self.cap.release()
-        cv2.destroyAllWindows()
+        
+        # Print statistics
+        if self.frame_count > 0:
+            detection_rate = (self.detection_count / self.frame_count) * 100
+            logger.info(f"Tracking stats: {self.detection_count}/{self.frame_count} frames with hand detected ({detection_rate:.1f}%)")
+        
         logger.info("Hand tracker stopped")
 
     def _restart_video(self) -> None:
         """Restart video from beginning."""
         if self.cap:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            logger.info("Video restarted")
+            logger.info("Video restarted - looping playback")
 
     def _detect_hand(self, frame):
         """
@@ -161,10 +171,6 @@ class HandTracker:
         center_x = int(moments["m10"] / moments["m00"])
         center_y = int(moments["m01"] / moments["m00"])
         
-        # Draw contour and center
-        cv2.drawContours(frame, [largest_contour], -1, (0, 255, 0), 2)
-        cv2.circle(frame, (center_x, center_y), 10, (0, 255, 0), -1)
-        
         # Normalize to -1.0 to 1.0
         norm_x = (center_x / self.frame_width - 0.5) * 2.0
         norm_y = (center_y / self.frame_height - 0.5) * 2.0
@@ -180,45 +186,43 @@ class HandTracker:
                     
                     # Loop video if it ends
                     if not ret:
-                        logger.info("End of video - restarting")
                         self._restart_video()
                         continue
 
+                    self.frame_count += 1
                     hand_detected = False
                     control_x = 0.0
                     control_y = 0.0
                     
-                    if not self.paused:
-                        # Detect hand
-                        raw_x, raw_y, hand_detected = self._detect_hand(frame)
-                        
-                        if hand_detected:
-                            # Apply dead zone
-                            if abs(raw_x) < DEAD_ZONE:
-                                raw_x = 0.0
-                            else:
-                                raw_x = (abs(raw_x) - DEAD_ZONE) / (1.0 - DEAD_ZONE)
-                                raw_x = raw_x if raw_x > 0 else -raw_x
-                                raw_x = raw_x * (1.0 if raw_x > 0 else -1.0)
-                            
-                            if abs(raw_y) < DEAD_ZONE:
-                                raw_y = 0.0
-                            else:
-                                raw_y = (abs(raw_y) - DEAD_ZONE) / (1.0 - DEAD_ZONE)
-                                raw_y = raw_y if raw_y > 0 else -raw_y
-                                raw_y = raw_y * (1.0 if raw_y > 0 else -1.0)
-                            
-                            # Smooth the values
-                            self.smooth_x = (SMOOTHING_FACTOR * raw_x + 
-                                            (1.0 - SMOOTHING_FACTOR) * self.smooth_x)
-                            self.smooth_y = (SMOOTHING_FACTOR * raw_y + 
-                                            (1.0 - SMOOTHING_FACTOR) * self.smooth_y)
-                            
-                            control_x = self.smooth_x
-                            control_y = -self.smooth_y  # Invert Y
+                    # Detect hand
+                    raw_x, raw_y, hand_detected = self._detect_hand(frame)
                     
-                    # Draw UI overlay
-                    self._draw_ui(frame, control_x, control_y, hand_detected)
+                    if hand_detected:
+                        self.detection_count += 1
+                        
+                        # Apply dead zone
+                        if abs(raw_x) < DEAD_ZONE:
+                            raw_x = 0.0
+                        else:
+                            raw_x = (abs(raw_x) - DEAD_ZONE) / (1.0 - DEAD_ZONE)
+                            raw_x = raw_x if raw_x > 0 else -raw_x
+                            raw_x = raw_x * (1.0 if raw_x > 0 else -1.0)
+                        
+                        if abs(raw_y) < DEAD_ZONE:
+                            raw_y = 0.0
+                        else:
+                            raw_y = (abs(raw_y) - DEAD_ZONE) / (1.0 - DEAD_ZONE)
+                            raw_y = raw_y if raw_y > 0 else -raw_y
+                            raw_y = raw_y * (1.0 if raw_y > 0 else -1.0)
+                        
+                        # Smooth the values
+                        self.smooth_x = (SMOOTHING_FACTOR * raw_x + 
+                                        (1.0 - SMOOTHING_FACTOR) * self.smooth_x)
+                        self.smooth_y = (SMOOTHING_FACTOR * raw_y + 
+                                        (1.0 - SMOOTHING_FACTOR) * self.smooth_y)
+                        
+                        control_x = self.smooth_x
+                        control_y = -self.smooth_y  # Invert Y
                     
                     # Update queue (non-blocking)
                     if not self.position_queue.full():
@@ -228,23 +232,19 @@ class HandTracker:
                             pass
                     self.position_queue.put((control_x, control_y, hand_detected))
                     
-                    # Show frame
-                    cv2.imshow('Hand Jog Control', frame)
+                    # Log status periodically
+                    if self.frame_count % (self.fps * 5) == 0:  # Every 5 seconds
+                        speed_x = control_x * MAX_JOG_SPEED
+                        speed_y = control_y * MAX_JOG_SPEED
+                        status = "HAND DETECTED" if hand_detected else "NO HAND"
+                        logger.info(f"Frame {self.frame_count}: {status} | Speed: X={speed_x:+.1f} Y={speed_y:+.1f} mm/s")
                     
-                    # Handle keyboard
-                    key = cv2.waitKey(max(1, int(1000 / self.fps))) & 0xFF
-                    if key == ord('q'):
-                        logger.info("Quit requested")
-                        self.running = False
-                    elif key == ord(' '):
-                        self.paused = not self.paused
-                        logger.info(f"Jogging {'paused' if self.paused else 'resumed'}")
-                    elif key == ord('r'):
-                        self._restart_video()
+                    # Small delay to match video FPS
+                    import time
+                    time.sleep(1.0 / self.fps)
                 
                 except cv2.error as e:
                     logger.error(f"OpenCV error: {e}")
-                    cv2.destroyAllWindows()
                     continue
                 except Exception as e:
                     logger.error(f"Error processing frame: {e}")
@@ -253,52 +253,6 @@ class HandTracker:
         except Exception as e:
             logger.error(f"Error in hand tracking: {e}")
             self.running = False
-
-    def _draw_ui(self, frame, control_x: float, control_y: float, detected: bool) -> None:
-        """Draw UI overlay on frame."""
-        h, w = frame.shape[:2]
-        
-        # Dead zone rectangle
-        dead_w = int(w * DEAD_ZONE)
-        dead_h = int(h * DEAD_ZONE)
-        cv2.rectangle(
-            frame,
-            (w // 2 - dead_w, h // 2 - dead_h),
-            (w // 2 + dead_w, h // 2 + dead_h),
-            (100, 100, 100),
-            2
-        )
-        
-        # Center crosshair
-        cv2.line(frame, (w // 2 - 20, h // 2), (w // 2 + 20, h // 2), (100, 100, 100), 1)
-        cv2.line(frame, (w // 2, h // 2 - 20), (w // 2, h // 2 + 20), (100, 100, 100), 1)
-        
-        # Status text
-        status = "PAUSED" if self.paused else ("HAND DETECTED" if detected else "NO HAND")
-        color = (0, 165, 255) if self.paused else ((0, 255, 0) if detected else (0, 0, 255))
-        cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        
-        # Speed indicators
-        speed_x = control_x * MAX_JOG_SPEED
-        speed_y = control_y * MAX_JOG_SPEED
-        cv2.putText(
-            frame,
-            f"X: {speed_x:+.1f} mm/s",
-            (10, h - 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2
-        )
-        cv2.putText(
-            frame,
-            f"Y: {speed_y:+.1f} mm/s",
-            (10, h - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2
-        )
 
 
 async def jog_control_loop(motion_group, tracker: HandTracker) -> None:
