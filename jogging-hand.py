@@ -27,6 +27,7 @@ import os
 
 import cv2
 import numpy as np
+import aiohttp
 
 import nova
 from nova import api, run_program
@@ -34,15 +35,21 @@ from nova.cell import virtual_controller
 from nova.core.nova import Nova
 from nova.program import ProgramPreconditions
 
+# Load environment variables for token
+from dotenv import load_dotenv
+load_dotenv()
+
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
 controller_name = "urdatta10"
+NOVA_API_URL = "https://bvyzqvgo.instance.wandelbots.io/api/v2"
+NOVA_TOKEN = os.getenv("NOVA_API_KEY")  # Get token from .env file
 
 # Video file path - UPDATE THIS to your video file
-VIDEO_FILE = "hand_video.mp4"  # or use absolute path like "/Users/sumalyodatta/Downloads/hand_video.mp4"
+VIDEO_FILE = "hand_video.mp4"
 
 # Hand tracking settings
 DEAD_ZONE = 0.15  # Center area where no jogging occurs (0.0-0.5)
@@ -200,6 +207,9 @@ class HandTracker:
                     if hand_detected:
                         self.detection_count += 1
                         
+                        # Log raw detection
+                        logger.debug(f"Raw hand position: x={raw_x:.3f}, y={raw_y:.3f}")
+                        
                         # Apply dead zone
                         if abs(raw_x) < DEAD_ZONE:
                             raw_x = 0.0
@@ -223,6 +233,8 @@ class HandTracker:
                         
                         control_x = self.smooth_x
                         control_y = -self.smooth_y  # Invert Y
+                        
+                        logger.debug(f"Control output: x={control_x:.3f}, y={control_y:.3f}")
                     
                     # Update queue (non-blocking)
                     if not self.position_queue.full():
@@ -232,8 +244,8 @@ class HandTracker:
                             pass
                     self.position_queue.put((control_x, control_y, hand_detected))
                     
-                    # Log status periodically
-                    if self.frame_count % (self.fps * 5) == 0:  # Every 5 seconds
+                    # Log status more frequently for debugging
+                    if self.frame_count % self.fps == 0:  # Every second
                         speed_x = control_x * MAX_JOG_SPEED
                         speed_y = control_y * MAX_JOG_SPEED
                         status = "HAND DETECTED" if hand_detected else "NO HAND"
@@ -265,47 +277,79 @@ async def jog_control_loop(motion_group, tracker: HandTracker) -> None:
     
     last_x = 0.0
     last_y = 0.0
-    mg_id = motion_group.id
+    mg_id = motion_group.motion_group_id
     
-    while tracker.running:
+    jog_command_count = 0
+    stop_command_count = 0
+    
+    # Create HTTP session with auth headers
+    headers = {
+        "Authorization": f"Bearer {NOVA_TOKEN}",
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    
+    # API endpoints
+    jog_url = f"{NOVA_API_URL}/cells/cell/motion-groups/{mg_id}/jogging"
+    
+    async with aiohttp.ClientSession(headers=headers) as session:
+        while tracker.running:
+            try:
+                control_x, control_y, hand_detected = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: tracker.position_queue.get(timeout=0.05)
+                )
+                
+                vel_x = control_x * MAX_JOG_SPEED
+                vel_y = control_y * MAX_JOG_SPEED
+                
+                if abs(vel_x - last_x) > 1.0 or abs(vel_y - last_y) > 1.0 or not hand_detected:
+                    if hand_detected and (abs(vel_x) > 0.1 or abs(vel_y) > 0.1):
+                        # Jog in Cartesian mode with velocity vector
+                        logger.info(f"Sending jog command: X={vel_x:.1f}, Y={vel_y:.1f} mm/s")
+                        
+                        payload = {
+                            "mode": "cartesian",
+                            "tcp_speed": [vel_x, vel_y, 0.0, 0.0, 0.0, 0.0]
+                        }
+                        
+                        async with session.post(jog_url, json=payload) as response:
+                            if response.status != 200:
+                                error_text = await response.text()
+                                logger.error(f"Jog API error: {response.status} - {error_text}")
+                            else:
+                                jog_command_count += 1
+                                logger.debug(f"Jog command successful")
+                        
+                        last_x = vel_x
+                        last_y = vel_y
+                    else:
+                        # Stop jogging
+                        logger.info("Sending stop jog command")
+                        
+                        async with session.delete(jog_url) as response:
+                            if response.status != 200:
+                                error_text = await response.text()
+                                logger.error(f"Stop jog API error: {response.status} - {error_text}")
+                            else:
+                                stop_command_count += 1
+                                logger.debug(f"Stop jog command successful")
+                        
+                        last_x = 0.0
+                        last_y = 0.0
+                        
+            except Exception as e:
+                logger.error(f"Jog error: {e}", exc_info=True)
+                await asyncio.sleep(0.01)
+        
+        # Stop jogging when exiting
         try:
-            control_x, control_y, hand_detected = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: tracker.position_queue.get(timeout=0.05)
-            )
-            
-            vel_x = control_x * MAX_JOG_SPEED
-            vel_y = control_y * MAX_JOG_SPEED
-            
-            if abs(vel_x - last_x) > 1.0 or abs(vel_y - last_y) > 1.0 or not hand_detected:
-                if hand_detected and (abs(vel_x) > 0.1 or abs(vel_y) > 0.1):
-                    # Jog in Cartesian mode with velocity vector
-                    await motion_group.api.execute_jogging(
-                        motion_group=mg_id,
-                        jogging_execution=api.models.JoggingExecution(
-                            mode="cartesian",
-                            tcp_speed=[vel_x, vel_y, 0.0, 0.0, 0.0, 0.0]
-                        )
-                    )
-                    last_x = vel_x
-                    last_y = vel_y
-                else:
-                    # Stop jogging
-                    await motion_group.api.stop_jogging(motion_group=mg_id)
-                    last_x = 0.0
-                    last_y = 0.0
-                    
+            async with session.delete(jog_url) as response:
+                logger.debug(f"Final stop jog: {response.status}")
         except Exception as e:
-            logger.debug(f"Jog error: {e}")
-            await asyncio.sleep(0.01)
+            logger.debug(f"Stop jogging error: {e}")
     
-    # Stop jogging when exiting
-    try:
-        await motion_group.api.stop_jogging(motion_group=mg_id)
-    except Exception as e:
-        logger.debug(f"Stop jogging error: {e}")
-    
-    logger.info("Jog control loop ended")
+    logger.info(f"Jog control loop ended - Sent {jog_command_count} jog commands, {stop_command_count} stop commands")
 
 
 @nova.program(
@@ -335,6 +379,7 @@ async def hand_jog():
             
             async with controller[0] as motion_group:
                 logger.info("Robot ready for hand control!")
+                logger.info(f"Motion Group ID: {motion_group.motion_group_id}")
                 logger.info(f"Dead zone: {DEAD_ZONE * 100:.0f}%")
                 logger.info(f"Max speed: {MAX_JOG_SPEED} mm/s")
                 
@@ -343,7 +388,7 @@ async def hand_jog():
     except KeyboardInterrupt:
         logger.info("\nShutting down hand jog...")
     except Exception as e:
-        logger.error(f"Error in hand jog program: {e}")
+        logger.error(f"Error in hand jog program: {e}", exc_info=True)
     finally:
         tracker.stop()
 
